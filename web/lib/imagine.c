@@ -285,7 +285,7 @@ float minX = 2147483647.0f;
 float maxX = -2147483648.0f;
 float minY = 2147483647.0f;
 float maxY = -2147483648.0f;
-float value = 0.01f;
+float value = 0.9f;
 
 float getMinX() {
   return minX;
@@ -585,7 +585,7 @@ int process(Pixel* input, unsigned int width, unsigned int height, Pixel* mask, 
     maxX = -2147483648.0f;
     minY = 2147483647.0f;
     maxY = -2147483648.0f;
-    value = 0.1f;
+    value = 0.9f;
   }
 
   Texture tex;

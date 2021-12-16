@@ -9,7 +9,9 @@ const OrbitControls = require('three-orbit-controls')(THREE);
 window.THREE = THREE;
 
 let lastFrameBuffer = null;
-
+let intermediate = null;
+let accumulated = null;
+let accumulate2 = null;
 let dataChannel = null;
 let pixelCount = 0;
 let pixelMap = {};
@@ -123,7 +125,430 @@ let uZ = 0.5;
 let stepRafID = null;
 let videoRafID = null;
 let pipelineStage = -1;
+let height;
+let width;
 
+const memory = new WebAssembly.Memory({ initial: 65536 });
+const arrayBuffer = memory.buffer;
+let inputArray;
+let outputArray;
+let maskArray;
+let inputContext;
+let outputCanvas;
+let outputContext;
+let video;
+let background = 0;
+let rect = null;
+let outputImageData;
+let compiled;
+let txCanvas = null;
+let tStart = performance.now();
+
+function loop() {
+  return function(context) {
+    context.render = () => {
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, -1, 0, uX, uY, uU, uV, uZ);
+    }
+  }
+}
+
+function motion() {
+  return function(context) {
+    if (context.detected) {
+      return true;
+    }
+    context.render = () => {
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 0, 0, 3, 0, uX, uY, uU, uV, uZ);
+      let movedPixels = 0;
+      for (let i = 0; i < outputArray.length; i+=4) {
+        if (outputArray[i] + outputArray[i+1] + outputArray[i+2] > 120) {
+          movedPixels++;
+        }
+      }
+      if (movedPixels > 50 && movedPixels < 100000) {
+        context.detected = true;
+      }
+    }
+  }
+}
+
+function threshold(from, to, speed, mask) {
+  return function(context) {
+    if (!this.value) {
+      this.value = from;
+      this.from = from;
+      this.to = to;
+      this.speed = speed;
+    }
+
+    if (this.value < this.to) {
+      this.value += speed;
+      uU = this.value;
+      // setSliderU(this.value * 100);
+    } else {
+      return true;
+    }
+
+    context.threshold = new Uint8ClampedArray(outputArray.length)
+    context.render = () => {
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, mask, 6, 0, uX, uY, uU, uV, uZ);
+      context.threshold.set(outputArray);
+    }
+  }
+}
+
+function accumulate(threshold, speed, mask) {
+  return function(context) {
+    intermediate = new Uint8ClampedArray(inputArray.length);
+    accumulated = new Uint8ClampedArray(outputArray.length);
+
+    context.render = () => {
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, mask, 6, 0, uX, uY, threshold, uV, uZ);
+      intermediate.set(outputArray);
+      inputArray.set(new Uint8ClampedArray(inputArray));
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 1, mask, 4, 0, uX, uY, speed, uV, uZ);
+      accumulated.set(new Uint8ClampedArray(outputArray));
+      inputArray.set(new Uint8ClampedArray(accumulated));
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, mask, 12, 0, uX, uY, speed, uV, uZ);
+    }
+    return true;
+  }
+}
+
+function accumulateMasked(threshold, speed, mask) {
+  return function(context) {
+    accumulate2 = new Uint8ClampedArray(outputArray.length);
+    compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 6, 1, uX, uY, threshold, uV, uZ);
+    context.render = () => {
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 6, 0, uX, uY, threshold, uV, uZ);
+      inputArray.set(new Uint8ClampedArray(outputArray));
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 2, 1, 4, 0, uX, uY, speed, uV, uZ);
+      accumulate2.set(new Uint8ClampedArray(outputArray));
+    }
+
+    return true;
+  }
+}
+
+function maxRegion() {
+  return function(context) {
+    context.maxRegionShot = new Uint8ClampedArray(outputArray.length);
+    context.maxRegionShot.set(outputArray);
+
+    context.render = () => {
+      inputArray.set(context.maxRegionShot);
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 23, 0, uX, uY, threshold, uV, uZ);
+    }
+
+    return true;
+  }
+}
+
+function invert() {
+  return function(context) {
+    context.render = () => {
+      console.log(context);
+      inputArray.set(accumulated);
+      compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 7, 0, uX, uY, uU, uV, uZ);
+    }
+
+    return true;
+  }
+}
+
+function wait(time) {
+  return function(context) {
+    if (!this.startTime) {
+      this.startTime = performance.now();
+    }
+
+    if (performance.now() - this.startTime > time) {
+      return true;
+    }
+  }
+}
+
+function color(color) {
+  return async function(context) {
+    await fetch('http://localhost:3001/pixels', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(Array(pixelCount).fill(color))
+    });
+    return true;
+  }
+}
+
+const mappingPipeline = [
+   color([10, 10, 10]),
+   wait(500),
+   threshold(0.0, 0.20, 0.005, 0),
+   wait(500),
+   color([0, 0, 0]),
+   wait(500),
+   threshold(0.05, 0.15, 0.01, 0),
+   wait(500),
+   accumulate(0.40, 0.01, 0),
+   wait(500),
+   invert(),
+   wait(500),
+   function copyNoiseMask(context) {
+     const copy = new Uint8ClampedArray(outputArray);
+     copy.set(outputArray);
+     maskArray.set(copy);
+     context.noiseMask = copy;
+     context.render = () => { }
+     return true;
+   },
+   color([10, 10, 10]),
+   wait(500),
+   threshold(0.0, 0.25, 0.005, 1),
+   wait(500),
+   accumulateMasked(0.25, 0.01, 1),
+   wait(5000),
+   function sampleAccOutput(context) {
+      maskArray.set(accumulate2);
+      const accumulate2ImageData = new ImageData(maskArray, width, height);
+      context.accumulate2ImageData = accumulate2ImageData;
+      outputContext.putImageData(accumulate2ImageData, 0, 0)
+      var link = document.createElement('a');
+      link.download = 'accumulatedSample.png';
+      link.href = outputCanvas.toDataURL();
+      link.click();
+
+      context.render = () => {
+      };
+      return true;
+   },
+   maxRegion(),
+   wait(500),
+   function sampleMaxOutput(context) {
+      const minX = compiled.instance.exports.getMinX() * width;
+      const minY = compiled.instance.exports.getMinY() * height;
+      const maxX = compiled.instance.exports.getMaxX() * width;
+      const maxY = compiled.instance.exports.getMaxY() * height;
+      rect = [minX, minY, maxX - minX, maxY - minY];
+      context.maxRegion = rect;
+      context.render = () => { };
+      return true;
+   },
+   async function sampleLights(context) {
+      if (context.currentLight === undefined) {
+        context.currentLight = 0;
+        rect = null;
+        context.t0 = performance.now();
+        context.lastUpdate = context.t0;
+        context.pixelMap = {};
+        pixelMap = context.pixelMap;
+        window.pixelMap = context.pixelMap;
+        maskArray.set(accumulate2);
+      }
+
+      if (context.currentLight === pixelCount) {
+        const a = document.createElement('a');
+        const fileToSave = new Blob([JSON.stringify(context.pixelMap)], {
+            type: 'application/json'
+        });
+        a.href = URL.createObjectURL(fileToSave);
+        a.download = 'pixelMap.json';
+        a.click()
+        return true;
+      }
+
+      const pixels = Array(pixelCount).fill([0, 0, 0]);
+      pixels[context.currentLight] = [250, 250, 250];
+      const pixelPayload = JSON.stringify(pixels);
+
+      context.render = () => { };
+      const now = performance.now();
+      if (now - context.lastUpdate > 1000) {
+        await fetch('http://localhost:3001/pixels', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: pixelPayload
+        });
+
+        // compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 1, 6, 0, uX, uY, 0.5, uV, uZ);
+        // inputArray.set(new Uint8ClampedArray(outputArray));
+        compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 23, 1, uX, uY, uU, uV, uZ);
+        context.lastUpdate = now;
+
+        const minX = compiled.instance.exports.getMinX() * width;
+        const minY = compiled.instance.exports.getMinY() * height;
+        const maxX = compiled.instance.exports.getMaxX() * width;
+        const maxY = compiled.instance.exports.getMaxY() * height;
+        const pw = maxX - minX;
+        const ph = maxY - minY;
+        if (maxX > minX && maxY > minY && pw < 100 && ph < 100) {
+          const px = (minX + maxX) / 2;
+          const py = (minY + maxY) / 2;
+
+          context.pixelMap[context.currentLight] = {
+            x: px, y: py
+          }
+        }
+        rect = [minX, minY, pw, ph];
+        context.currentLight++;
+      }
+   },
+   function reset(context) {
+     context.render = () => { }
+     pipelineStageState = pipeline.map(stage => {
+       return {};
+     });
+
+     pipelineContext = {};
+
+     pipeline = pipeline.map((stage, i) => {
+       return stage.bind(pipelineStageState[i]);
+     });
+     pipelineStage = -1;
+   },
+];
+
+const killPipeline = [
+  motion(),
+  function putCircle() {
+    const ctx = txCanvas.getContext('2d');
+    var X = txCanvas.width / 2;
+    var Y = txCanvas.height / 2;
+    var R = 45;
+    ctx.beginPath();
+    ctx.arc(X, Y, R, 0, 2 * Math.PI, false);
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+    const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
+    copyImageDataToFrameBuffer(imageData);
+    sendLastFrameBuffer();
+
+    document.getElementById('audioEffect1').play();
+    return true;
+  },
+  wait(5000),
+  async function killStage() {
+    const ctx = txCanvas.getContext('2d');
+    var X = txCanvas.width / 2;
+    var Y = txCanvas.height / 2;
+    var R = 45;
+
+    ctx.fillStyle = "red";
+    ctx.fillRect(0, 0, txCanvas.width, txCanvas.height);
+
+    ctx.beginPath();
+    ctx.arc(X, Y, R, 0, 2 * Math.PI, false);
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+    const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
+    copyImageDataToFrameBuffer(imageData);
+    sendLastFrameBuffer();
+    return true;
+  },
+  wait(3000),
+  async function cleanStage() {
+    const ctx = txCanvas.getContext('2d');
+
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, txCanvas.width, txCanvas.height);
+
+    const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
+    copyImageDataToFrameBuffer(imageData);
+    sendLastFrameBuffer();
+    return true;
+  },
+];
+
+let pipeline = [];
+
+let pipelineStageState = pipeline.map(stage => {
+  return {};
+});
+
+let pipelineContext = {};
+
+pipeline = pipeline.map((stage, i) => {
+  return stage.bind(pipelineStageState[i]);
+});
+
+async function drawVideo() {
+  uV = performance.now();
+  let tEnd = performance.now();
+  let total = tEnd - tStart;
+  tStart = tEnd;
+  inputContext.drawImage(video, 0, 0, width * 2, height * 2, 0, 0, width, height);
+  const inputData = inputContext.getImageData(0, 0, width, height);
+
+  inputArray.set(inputData.data, 0);
+  let tStartNative = performance.now();
+
+  if (pipelineStage > -1) {
+    const stage = pipeline[pipelineStage];
+    let next = false;
+    if (stage) {
+      if (stage.resolve || stage.constructor.name === "AsyncFunction") {
+        next = await stage(pipelineContext);
+      } else {
+        next = stage(pipelineContext);
+      }
+    } else {
+        loop()(pipelineContext);
+    }
+
+    if (next) {
+      pipelineStage++;
+    }
+  } else {
+    loop()(pipelineContext);
+  }
+
+  if (pipelineContext.render) {
+    pipelineContext.render();
+  }
+
+  let tEndNative = performance.now();
+
+  outputContext.putImageData(outputImageData, 0, 0)
+
+  // fps
+  outputContext.fillStyle = 'white';
+  outputContext.strokeStyle = 'black';
+
+  outputContext.font = "30px Arial";
+  outputContext.fillText(`Native time: ${(tEndNative - tStartNative).toFixed(2)} ms`, 10, 50);
+  outputContext.fillText(`Total time: ${total.toFixed(2)} ms`, 10, 100);
+  outputContext.fillText(`FPS: ${(1000/total).toFixed(0)}`, 10, 150);
+  outputContext.strokeText(`Native time: ${(tEndNative - tStartNative).toFixed(2)} ms`, 10, 50);
+  outputContext.strokeText(`Total time: ${total.toFixed(2)} ms`, 10, 100);
+  outputContext.strokeText(`FPS: ${(1000/total).toFixed(0)}`, 10, 150);
+
+  if (rect) {
+    outputContext.beginPath();
+    outputContext.strokeStyle = "green";
+    outputContext.rect(...rect);
+    outputContext.stroke();
+  }
+
+  videoRafID = requestAnimationFrame(drawVideo);
+};
+
+
+
+fetch('/imagine.bin')
+.then(response => response.arrayBuffer())
+.then(bytes => WebAssembly.instantiate(bytes, {
+    env: {
+      memory,
+    }
+  })
+)
+.then(instance => {
+  compiled = instance;
+});
 
 function App() {
   const [devices, setDevices] = useState([]);
@@ -137,6 +562,26 @@ function App() {
   const [audioPlaying, setAudioPlaying] = useState(false);
   const [audioContext, setAudioContext] = useState(null);
   const [mode, setMode] = useState(0);
+
+  useEffect(() => {
+      pipeline = mode === 0 ? mappingPipeline : killPipeline;
+
+      pipelineStageState = pipeline.map(stage => {
+        return {};
+      });
+
+      pipelineContext = {};
+
+      pipeline = pipeline.map((stage, i) => {
+        return stage.bind(pipelineStageState[i]);
+      });
+     if (mode === 1) {
+       if (videoRafID) {
+         cancelAnimationFrame(videoRafID);
+       }
+       pipelineStage = 0;
+     }
+  }, [mode]);
 
   useEffect(() => {
 
@@ -319,7 +764,7 @@ function App() {
 
     createClient('webrtc', { beforeAnswer: rtcClient, RTCPeerConnection });
 
-    let txCanvas = document.getElementById("tx");
+    txCanvas = document.getElementById("tx");
     txCanvas.addEventListener("mousedown", function(e)
     {
       const rect = txCanvas.getBoundingClientRect();
@@ -336,7 +781,41 @@ function App() {
       sendLastFrameBuffer();
     });
 
+    let canvas = document.getElementById('input');
+    inputContext = canvas.getContext('2d');
+    outputCanvas = document.getElementById('output');
+    outputContext = outputCanvas.getContext('2d');
 
+    video = document.createElement('video');
+    video.autoplay = true;
+    video.preload = "auto";
+
+    navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { width: { min: 640 }, height: { min: 480 } }
+    }).then(function success(stream) {
+      video.srcObject = stream;
+      video.addEventListener('canplaythrough', function(ev) {
+        height = video.videoHeight / 2;
+        width = video.videoWidth / 2;
+        inputArray = new Uint8ClampedArray(arrayBuffer, compiled.instance.exports.__data_end.value, width * height * 4);
+        outputArray = new Uint8ClampedArray(arrayBuffer, inputArray.byteOffset + inputArray.length, width * height * 4);
+        maskArray = new Uint8ClampedArray(arrayBuffer, outputArray.byteOffset + outputArray.length, width * height * 4);
+        intermediate = new Uint8ClampedArray(inputArray.length);
+        accumulated = new Uint8ClampedArray(outputArray.length);
+        accumulate2 = new Uint8ClampedArray(outputArray.length);
+
+        canvas.width = width;
+        canvas.height = height;
+        outputCanvas.width = width;
+        outputCanvas.height = height;
+        outputImageData = new ImageData(outputArray, width, height);
+
+        videoRafID = requestAnimationFrame(drawVideo);
+      }, false);
+    }).catch(function(err) {
+        console.log("An error occurred: " + err);
+    });
 
     if (audioContext === null) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -356,12 +835,7 @@ function App() {
       requestAnimationFrame(draw);
     }
 
-    const video = document.createElement('video');
-    video.autoplay = true;
-    video.preload = "auto";
-    let height;
-    let width;
-    let canvas = document.getElementById('input');
+
 
     const renderer = new THREE.WebGLRenderer();
     renderer.setSize(640, 300);
@@ -401,408 +875,6 @@ function App() {
     }
     animate();
 
-    let inputContext = canvas.getContext('2d');
-    let outputCanvas = document.getElementById('output');
-    let outputContext = outputCanvas.getContext('2d');
-    const memory = new WebAssembly.Memory({ initial: 65536 });
-    const arrayBuffer = memory.buffer;
-    let inputArray;
-    let outputArray;
-    let maskArray;
-    let background = 0;
-    let rect = null;
-    let outputImageData;
-    let compiled;
-    let tStart = performance.now();
-
-    function loop() {
-      return function(context) {
-        context.render = () => {
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, -1, 0, uX, uY, uU, uV, uZ);
-        }
-      }
-    }
-
-    function motion() {
-      return function(context) {
-        if (context.detected) {
-          return true;
-        }
-        // compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 0, 0, -1, 1, uX, uY, uU, uV, uZ);
-        context.render = () => {
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 0, 0, 3, 0, uX, uY, uU, uV, uZ);
-          let movedPixels = 0;
-          for (let i = 0; i < outputArray.length; i+=4) {
-            if (outputArray[i] + outputArray[i+1] + outputArray[i+2] > 120) {
-              movedPixels++;
-            }
-          }
-          if (movedPixels > 50 && movedPixels < 100000) {
-            context.detected = true;
-          }
-        }
-      }
-    }
-
-    function threshold(from, to, speed, mask) {
-      return function(context) {
-        if (!this.value) {
-          this.value = from;
-          this.from = from;
-          this.to = to;
-          this.speed = speed;
-        }
-
-        if (this.value < this.to) {
-          this.value += speed;
-          uU = this.value;
-          setSliderU(this.value * 100);
-        } else {
-          return true;
-        }
-
-        context.threshold = new Uint8ClampedArray(outputArray.length)
-        context.render = () => {
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, mask, 6, 0, uX, uY, uU, uV, uZ);
-          context.threshold.set(outputArray);
-        }
-      }
-    }
-
-    function accumulate(threshold, speed, mask) {
-      return function(context) {
-        context.intermediate = Uint8ClampedArray.from(inputArray);
-        context.accumulated = Uint8ClampedArray.from(outputArray);
-
-        context.render = () => {
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, context.intermediate.byteOffset, background, mask, 6, 0, uX, uY, threshold, uV, uZ);
-          compiled.instance.exports.process(context.intermediate.byteOffset, width, height, maskArray.byteOffset, context.accumulated.byteOffset, 1, mask, 4, 0, uX, uY, speed, uV, uZ);
-          compiled.instance.exports.process(context.accumulated.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, mask, 12, 0, uX, uY, speed, uV, uZ);
-        }
-        return true;
-      }
-    }
-
-    function accumulateMasked(threshold, speed, mask) {
-      return function(context) {
-        context.accumulate2 = new Uint8ClampedArray(outputArray.length);
-        compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 6, 1, uX, uY, threshold, uV, uZ);
-        context.render = () => {
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 6, 0, uX, uY, threshold, uV, uZ);
-          inputArray.set(new Uint8ClampedArray(outputArray));
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, 2, 1, 4, 0, uX, uY, speed, uV, uZ);
-          context.accumulate2.set(new Uint8ClampedArray(outputArray));
-        }
-
-        return true;
-      }
-    }
-
-    function maxRegion() {
-      return function(context) {
-        context.maxRegionShot = new Uint8ClampedArray(outputArray.length);
-        context.maxRegionShot.set(outputArray);
-
-        context.render = () => {
-          inputArray.set(context.maxRegionShot);
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 23, 0, uX, uY, threshold, uV, uZ);
-        }
-
-        return true;
-      }
-    }
-
-    function invert() {
-      return function(context) {
-        context.render = () => {
-          inputArray.set(context.accumulated);
-          compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 7, 0, uX, uY, uU, uV, uZ);
-        }
-
-        return true;
-      }
-    }
-
-    function wait(time) {
-      return function(context) {
-        if (!this.startTime) {
-          this.startTime = performance.now();
-        }
-
-        if (performance.now() - this.startTime > time) {
-          return true;
-        }
-      }
-    }
-
-    function color(color) {
-      return async function(context) {
-        await fetch('http://localhost:3001/pixels', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(Array(pixelCount).fill(color))
-        });
-        return true;
-      }
-    }
-
-    const mappingPipeline = [
-       color([10, 10, 10]),
-       wait(500),
-       threshold(0.0, 0.20, 0.005, 0),
-       wait(500),
-       color([0, 0, 0]),
-       wait(500),
-       threshold(0.05, 0.15, 0.01, 0),
-       wait(500),
-       accumulate(0.40, 0.01, 0),
-       wait(500),
-       invert(),
-       wait(500),
-       function copyNoiseMask(context) {
-         const copy = new Uint8ClampedArray(outputArray);
-         copy.set(outputArray);
-         maskArray.set(copy);
-         context.noiseMask = copy;
-         context.render = () => { }
-         return true;
-       },
-       color([10, 10, 10]),
-       wait(500),
-       threshold(0.0, 0.25, 0.005, 1),
-       wait(500),
-       accumulateMasked(0.25, 0.01, 1),
-       wait(5000),
-       function sampleAccOutput(context) {
-          maskArray.set(context.accumulate2);
-          const accumulate2ImageData = new ImageData(maskArray, width, height);
-          context.accumulate2ImageData = accumulate2ImageData;
-          outputContext.putImageData(accumulate2ImageData, 0, 0)
-          var link = document.createElement('a');
-          link.download = 'accumulatedSample.png';
-          link.href = outputCanvas.toDataURL();
-          link.click();
-
-          context.render = () => {
-          };
-          return true;
-       },
-       maxRegion(),
-       wait(500),
-       function sampleMaxOutput(context) {
-          const minX = compiled.instance.exports.getMinX() * width;
-          const minY = compiled.instance.exports.getMinY() * height;
-          const maxX = compiled.instance.exports.getMaxX() * width;
-          const maxY = compiled.instance.exports.getMaxY() * height;
-          rect = [minX, minY, maxX - minX, maxY - minY];
-          context.maxRegion = rect;
-          context.render = () => { };
-          return true;
-       },
-       async function sampleLights(context) {
-          if (context.currentLight === undefined) {
-            context.currentLight = 0;
-            rect = null;
-            context.t0 = performance.now();
-            context.lastUpdate = context.t0;
-            context.pixelMap = {};
-            pixelMap = context.pixelMap;
-            window.pixelMap = context.pixelMap;
-            maskArray.set(context.accumulate2);
-          }
-
-          if (context.currentLight === pixelCount) {
-            const a = document.createElement('a');
-            const fileToSave = new Blob([JSON.stringify(context.pixelMap)], {
-                type: 'application/json'
-            });
-            a.href = URL.createObjectURL(fileToSave);
-            a.download = 'pixelMap.json';
-            a.click()
-            return true;
-          }
-
-          const pixels = Array(pixelCount).fill([0, 0, 0]);
-          pixels[context.currentLight] = [250, 250, 250];
-          const pixelPayload = JSON.stringify(pixels);
-
-          context.render = () => { };
-          const now = performance.now();
-          if (now - context.lastUpdate > 1000) {
-            await fetch('http://localhost:3001/pixels', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: pixelPayload
-            });
-
-            compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 1, 6, 1, uX, uY, 0.5, uV, uZ);
-            inputArray.set(new Uint8ClampedArray(outputArray));
-            compiled.instance.exports.process(inputArray.byteOffset, width, height, maskArray.byteOffset, outputArray.byteOffset, background, 0, 23, 0, uX, uY, uU, uV, uZ);
-            context.lastUpdate = now;
-
-            const minX = compiled.instance.exports.getMinX() * width;
-            const minY = compiled.instance.exports.getMinY() * height;
-            const maxX = compiled.instance.exports.getMaxX() * width;
-            const maxY = compiled.instance.exports.getMaxY() * height;
-            const pw = maxX - minX;
-            const ph = maxY - minY;
-            if (maxX > minX && maxY > minY && pw < 100 && ph < 100) {
-              const px = (minX + maxX) / 2;
-              const py = (minY + maxY) / 2;
-
-              context.pixelMap[context.currentLight] = {
-                x: px, y: py
-              }
-            }
-            rect = [minX, minY, pw, ph];
-            context.currentLight++;
-          }
-       },
-       function reset(context) {
-         context.render = () => { }
-         pipelineStageState = pipeline.map(stage => {
-           return {};
-         });
-
-         pipelineContext = {};
-
-         pipeline = pipeline.map((stage, i) => {
-           return stage.bind(pipelineStageState[i]);
-         });
-         pipelineStage = -1;
-       },
-    ];
-
-    const killPipeline = [
-      motion(),
-      function putCircle() {
-        const ctx = txCanvas.getContext('2d');
-        var X = txCanvas.width / 2;
-        var Y = txCanvas.height / 2;
-        var R = 45;
-        ctx.beginPath();
-        ctx.arc(X, Y, R, 0, 2 * Math.PI, false);
-        ctx.lineWidth = 5;
-        ctx.strokeStyle = '#FFFFFF';
-        ctx.stroke();
-        const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
-        copyImageDataToFrameBuffer(imageData);
-        sendLastFrameBuffer();
-
-        document.getElementById('audioEffect1').play();
-        return true;
-      },
-      wait(5000),
-      async function killStage() {
-        const ctx = txCanvas.getContext('2d');
-        var X = txCanvas.width / 2;
-        var Y = txCanvas.height / 2;
-        var R = 45;
-
-        ctx.fillStyle = "red";
-        ctx.fillRect(0, 0, txCanvas.width, txCanvas.height);
-
-        ctx.beginPath();
-        ctx.arc(X, Y, R, 0, 2 * Math.PI, false);
-        ctx.lineWidth = 5;
-        ctx.strokeStyle = '#FFFFFF';
-        ctx.stroke();
-        const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
-        copyImageDataToFrameBuffer(imageData);
-        sendLastFrameBuffer();
-        return true;
-      },
-      wait(3000),
-      async function cleanStage() {
-        const ctx = txCanvas.getContext('2d');
-
-        ctx.fillStyle = "black";
-        ctx.fillRect(0, 0, txCanvas.width, txCanvas.height);
-
-        const imageData = ctx.getImageData(0, 0, txCanvas.width, txCanvas.height);
-        copyImageDataToFrameBuffer(imageData);
-        sendLastFrameBuffer();
-        return true;
-      },
-    ];
-    console.log(mode);
-    let pipeline = mode === 0 ? mappingPipeline : killPipeline;
-
-    let pipelineStageState = pipeline.map(stage => {
-      return {};
-    });
-
-    let pipelineContext = {};
-
-    pipeline = pipeline.map((stage, i) => {
-      return stage.bind(pipelineStageState[i]);
-    });
-
-    async function drawVideo() {
-      uV = performance.now();
-      let tEnd = performance.now();
-      let total = tEnd - tStart;
-      tStart = tEnd;
-      inputContext.drawImage(video, 0, 0, width * 2, height * 2, 0, 0, width, height);
-      const inputData = inputContext.getImageData(0, 0, width, height);
-
-      inputArray.set(inputData.data, 0);
-      let tStartNative = performance.now();
-
-      if (pipelineStage > -1) {
-        const stage = pipeline[pipelineStage];
-        let next = false;
-        if (stage) {
-          if (stage.resolve || stage.constructor.name === "AsyncFunction") {
-            next = await stage(pipelineContext);
-          } else {
-            next = stage(pipelineContext);
-          }
-        } else {
-            loop()(pipelineContext);
-        }
-
-        if (next) {
-          pipelineStage++;
-        }
-      } else {
-        loop()(pipelineContext);
-      }
-
-      if (pipelineContext.render) {
-        pipelineContext.render();
-      }
-
-      let tEndNative = performance.now();
-
-      outputContext.putImageData(outputImageData, 0, 0)
-
-      // fps
-      outputContext.fillStyle = 'white';
-      outputContext.strokeStyle = 'black';
-
-      outputContext.font = "30px Arial";
-      outputContext.fillText(`Native time: ${(tEndNative - tStartNative).toFixed(2)} ms`, 10, 50);
-      outputContext.fillText(`Total time: ${total.toFixed(2)} ms`, 10, 100);
-      outputContext.fillText(`FPS: ${(1000/total).toFixed(0)}`, 10, 150);
-      outputContext.strokeText(`Native time: ${(tEndNative - tStartNative).toFixed(2)} ms`, 10, 50);
-      outputContext.strokeText(`Total time: ${total.toFixed(2)} ms`, 10, 100);
-      outputContext.strokeText(`FPS: ${(1000/total).toFixed(0)}`, 10, 150);
-
-      if (rect) {
-        outputContext.beginPath();
-        outputContext.strokeStyle = "green";
-        outputContext.rect(...rect);
-        outputContext.stroke();
-      }
-
-      videoRafID = requestAnimationFrame(drawVideo);
-    };
-
     const videoSource = document.createElement('video');
     videoSource.autoplay = true;
     videoSource.preload = "auto";
@@ -830,40 +902,6 @@ function App() {
      videoSource.src = videoFileUrl;
    }
 
-    fetch('/imagine.bin')
-      .then(response => response.arrayBuffer())
-      .then(bytes => WebAssembly.instantiate(bytes, {
-          env: {
-            memory,
-          }
-        })
-      )
-      .then(instance => {
-        compiled = instance;
-        navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { width: { min: 640 }, height: { min: 480 } }
-        }).then(function success(stream) {
-          video.srcObject = stream;
-          video.addEventListener('canplaythrough', function(ev) {
-            height = video.videoHeight / 2;
-            width = video.videoWidth / 2;
-            inputArray = new Uint8ClampedArray(arrayBuffer, instance.instance.exports.__data_end.value, width * height * 4);
-            outputArray = new Uint8ClampedArray(arrayBuffer, inputArray.byteOffset + inputArray.length, width * height * 4);
-            maskArray = new Uint8ClampedArray(arrayBuffer, outputArray.byteOffset + outputArray.length, width * height * 4);
-            canvas.width = width;
-            canvas.height = height;
-            outputCanvas.width = width;
-            outputCanvas.height = height;
-            outputImageData = new ImageData(outputArray, width, height);
-
-            videoRafID = requestAnimationFrame(drawVideo);
-         }, false);
-        }).catch(function(err) {
-            console.log("An error occurred: " + err);
-        });
-      });
-
     return async function cleanup() {
       if (audioContext !== null) {
         await audioContext.close();
@@ -871,16 +909,7 @@ function App() {
       renderer.domElement.remove();
     };
 
-  }, [videoFileUrl, audioPlaying, audioContext, mode]);
-
-  useEffect(() => {
-     if (mode === 1) {
-       if (videoRafID) {
-         cancelAnimationFrame(videoRafID);
-       }
-       pipelineStage = 0;
-     }
-  }, [mode]);
+  }, [videoFileUrl, audioPlaying]);
 
   return (
     <div className="App" id="main">
@@ -903,7 +932,7 @@ function App() {
       </div>
 
       <audio id="audioSource1"></audio>
-      <audio id="audioEffect1" src="squid.mp3"></audio>
+      <audio id="audioEffect1" src="squidnoshot.mp3"></audio>
       <div style={{
         display: 'flex',
         flexDirection: 'row',
