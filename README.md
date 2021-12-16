@@ -14,6 +14,8 @@ Virtual Production at home:
 
 [vpathome]: https://user-images.githubusercontent.com/6011630/146373156-cc6657dd-6c42-423e-a668-45803968b410.mov "Virtual Production at home"
 
+![Virtual Production at home 2](doc/vpathome.jpg)
+
 
 # Disclaimer
 All trademarks, logos and brand names are the property of their respective owners. All company, product and service names used in this project are for identification purposes only. Use of these names, trademarks and brands does not imply endorsement nor association.
