@@ -1,0 +1,28 @@
+.App {
+  text-align: center;
+}
+
+html {
+  background-color: black;
+  color: white;
+}
+
+canvas {
+  border-style: solid;
+  border-color: white;
+  border-width: 1px;
+  flex: 1;
+}
+
+button {
+  background-color: black;
+  border-color: white;
+  border-width: 1px;
+  border-style: solid;
+  color: white;
+}
+
+label {
+  margin-left: 10px;
+  margin-right: 10px;
+}
