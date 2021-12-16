@@ -12,3 +12,8 @@
    - write(r, g, b) - write RGB values into the appropriate device buffer location
  - send - optimistic/real-time I/O that sends the color buffer to the device
  - sendSync - sends the color buffer reliably to the device
+
+
+ This cat redirects to the main README file:
+
+ ![Cat Redirect](doc/302catredirect.jpg)
